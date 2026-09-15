@@ -1,2 +1,8 @@
-# gif-folders-bd
-Allow gif folders to better organize gifs in your BetterDiscord
+<div align="center">
+
+# 📁 Gif-Folders
+**Better organize your Discord GIFs into custom folders and tags.**
+
+*Inspired by [ImageFolder](https://betterdiscord.app/plugins/ImageFolder) & [Thunde's GIF Folders](https://github.com/thundeiv/Thunde-s-GIF-Folders-for-Vencord)*
+
+<p align="center">Made by <a href="https://github.com/Ches">Ches</a></p>
