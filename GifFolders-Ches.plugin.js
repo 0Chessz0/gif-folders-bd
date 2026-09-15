@@ -1,7 +1,7 @@
 /**
  * @name GifFolders
  * @description Adds persistent folders for your existing Discord favorite GIFs.
- * @version 1.1.1
+ * @version 1.2.2
  * @author Ches
  * @authorLink https://github.com/0Chessz0
  */
@@ -26,11 +26,14 @@ module.exports = class GifFolders {
         this.dragState = null;
         this.dialogOpen = false;
         this.activeDialog = null;
+        this.sendingGif = false;
         this.state = this.loadState();
 
         this.FrecencyUserSettings = null;
         this.SelectedChannelStore = null;
         this.MessageActions = null;
+        this.ComponentDispatch = null;
+        this.RestAPI = null;
     }
 
     start() {
@@ -95,9 +98,10 @@ module.exports = class GifFolders {
 
     defaultState() {
         return {
-            version: 1,
+            version: 2,
             folders: [],
             assignments: {},
+            orders: {},
             selectedFolder: "default"
         };
     }
@@ -114,6 +118,12 @@ module.exports = class GifFolders {
                 .map(folder => ({id: folder.id, name: folder.name.trim() || "Folder"}))
             : [];
         state.assignments = saved.assignments && typeof saved.assignments === "object" ? saved.assignments : {};
+        state.orders = saved.orders && typeof saved.orders === "object"
+            ? Object.fromEntries(Object.entries(saved.orders).map(([folderId, urls]) => [
+                folderId,
+                Array.isArray(urls) ? urls.filter(url => typeof url === "string") : []
+            ]))
+            : {};
         state.selectedFolder = typeof saved.selectedFolder === "string" ? saved.selectedFolder : "default";
 
         if (state.selectedFolder !== "default" && !state.folders.some(folder => folder.id === state.selectedFolder)) {
@@ -132,11 +142,32 @@ module.exports = class GifFolders {
 
         this.SelectedChannelStore = Webpack.getStore("SelectedChannelStore");
 
-        this.MessageActions = Webpack.getByKeys("sendMessage", "editMessage") ||
+        this.MessageActions = Webpack.getModule(Webpack.Filters.byKeys("sendMessage")) ||
+            Webpack.getByKeys("sendMessage", "editMessage") ||
             Webpack.getModule(
                 module => typeof module?.sendMessage === "function" && typeof module?.editMessage === "function",
                 {searchExports: true}
             );
+
+        this.ComponentDispatch = Webpack.getAllByKeys?.(
+            "safeDispatch",
+            "dispatchToLastSubscribed",
+            {searchExports: true}
+        )?.find(module => module?.options?.logger != null) ||
+            Webpack.getModule(
+                module => typeof module?.dispatchToLastSubscribed === "function" &&
+                    typeof module?.safeDispatch === "function",
+                {searchExports: true}
+            );
+
+        this.RestAPI = Webpack.getModule(
+            module => module && typeof module === "object" &&
+                typeof module.get === "function" &&
+                typeof module.post === "function" &&
+                typeof module.put === "function" &&
+                typeof module.del === "function",
+            {searchExports: true}
+        );
 
         this.FrecencyUserSettings = Webpack.getModule(
             module => module?.ProtoClass?.typeName?.endsWith?.(".FrecencyUserSettings") && typeof module?.getCurrentValue === "function",
@@ -191,14 +222,38 @@ module.exports = class GifFolders {
     }
 
     getGifsForFolder(folderId) {
-        return this.getFavorites().filter(gif => this.getFolderIdForGif(gif.url) === folderId);
+        const gifs = this.getFavorites().filter(gif => this.getFolderIdForGif(gif.url) === folderId);
+        const byUrl = new Map(gifs.map(gif => [gif.url, gif]));
+        const ordered = [];
+
+        for (const url of this.state.orders[folderId] || []) {
+            const gif = byUrl.get(url);
+            if (!gif) continue;
+            ordered.push(gif);
+            byUrl.delete(url);
+        }
+
+        return [...ordered, ...byUrl.values()];
     }
 
-    moveGif(url, targetFolderId) {
+    moveGif(url, targetFolderId, beforeUrl = null) {
         if (!this.folderExists(targetFolderId)) return;
+
+        const targetOrder = this.getGifsForFolder(targetFolderId)
+            .map(gif => gif.url)
+            .filter(itemUrl => itemUrl !== url);
+
+        const insertAt = beforeUrl ? targetOrder.indexOf(beforeUrl) : -1;
+        if (insertAt >= 0) targetOrder.splice(insertAt, 0, url);
+        else targetOrder.push(url);
+
+        for (const folderId of Object.keys(this.state.orders)) {
+            this.state.orders[folderId] = this.state.orders[folderId].filter(itemUrl => itemUrl !== url);
+        }
 
         if (targetFolderId === "default") delete this.state.assignments[url];
         else this.state.assignments[url] = targetFolderId;
+        this.state.orders[targetFolderId] = targetOrder;
 
         this.saveState();
         this.renderFolderView();
@@ -319,6 +374,10 @@ module.exports = class GifFolders {
     }
 
     findGifHomeGrid() {
+        // Discord's GIF home cards are no longer guaranteed to be buttons. Search
+        // their visible labels instead, then find the first shared row/grid that
+        // owns both cards. This survives Discord changing the wrapper element or
+        // removing tabindex/role attributes from the cards.
         const favoriteLabels = this.findExactTextElements("Favorites");
         const trendingLabels = this.findExactTextElements("Trending GIFs");
 
@@ -523,7 +582,7 @@ module.exports = class GifFolders {
 
     renderGifGrid(grid) {
         const allFavorites = this.getFavorites();
-        const gifs = allFavorites.filter(gif => this.getFolderIdForGif(gif.url) === this.state.selectedFolder);
+        const gifs = this.getGifsForFolder(this.state.selectedFolder);
 
         if (!allFavorites.length) {
             grid.append(this.makeEmptyState(
@@ -554,6 +613,7 @@ module.exports = class GifFolders {
         card.type = "button";
         card.title = "Click to send · Drag to move";
         card.setAttribute("aria-label", "Favorite GIF");
+        card.dataset.gifUrl = gif.url;
 
         let media;
         const looksLikeVideo = gif.format === 2 || /\.(mp4|webm)(?:$|\?)/i.test(gif.src);
@@ -583,7 +643,7 @@ module.exports = class GifFolders {
                 event.preventDefault();
                 return;
             }
-            this.sendGif(gif.url);
+            this.sendGif(gif);
         });
 
         card.addEventListener("pointerdown", event => this.startPointerDrag(event, gif, card));
@@ -604,7 +664,8 @@ module.exports = class GifFolders {
             gif,
             card,
             moved: false,
-            target: null,
+            targetFolder: null,
+            targetCard: null,
             ghost: null,
             move: null,
             up: null
@@ -638,11 +699,20 @@ module.exports = class GifFolders {
         state.ghost.style.left = `${state.x + 14}px`;
         state.ghost.style.top = `${state.y + 14}px`;
 
-        const target = document.elementFromPoint(state.x, state.y)?.closest?.(".gf-folder") || null;
-        if (target !== state.target) {
-            state.target?.classList.remove("gf-drop-target");
-            state.target = target;
-            state.target?.classList.add("gf-drop-target");
+        const hovered = document.elementFromPoint(state.x, state.y);
+        const targetFolder = hovered?.closest?.(".gf-folder") || null;
+        const hoveredCard = hovered?.closest?.(".gf-gif-card") || null;
+        const targetCard = hoveredCard && hoveredCard !== state.card ? hoveredCard : null;
+
+        if (targetFolder !== state.targetFolder) {
+            state.targetFolder?.classList.remove("gf-drop-target");
+            state.targetFolder = targetFolder;
+            state.targetFolder?.classList.add("gf-drop-target");
+        }
+        if (targetCard !== state.targetCard) {
+            state.targetCard?.classList.remove("gf-reorder-target");
+            state.targetCard = targetCard;
+            state.targetCard?.classList.add("gf-reorder-target");
         }
     }
 
@@ -650,7 +720,10 @@ module.exports = class GifFolders {
         const state = this.dragState;
         if (!state || event.pointerId !== state.pointerId) return;
 
-        const targetFolderId = state.moved ? state.target?.dataset?.folderId : null;
+        const targetFolderId = state.moved
+            ? state.targetFolder?.dataset?.folderId || (state.targetCard ? this.state.selectedFolder : null)
+            : null;
+        const beforeUrl = state.targetCard?.dataset?.gifUrl || null;
         if (state.moved) {
             event.preventDefault();
             event.stopPropagation();
@@ -658,7 +731,7 @@ module.exports = class GifFolders {
         }
 
         this.cancelPointerDrag();
-        if (targetFolderId) this.moveGif(state.gif.url, targetFolderId);
+        if (targetFolderId) this.moveGif(state.gif.url, targetFolderId, beforeUrl);
     }
 
     cancelPointerDrag() {
@@ -669,7 +742,8 @@ module.exports = class GifFolders {
         document.removeEventListener("pointerup", state.up, true);
         document.removeEventListener("pointercancel", state.up, true);
         state.card?.classList.remove("gf-dragging");
-        state.target?.classList.remove("gf-drop-target");
+        state.targetFolder?.classList.remove("gf-drop-target");
+        state.targetCard?.classList.remove("gf-reorder-target");
         state.ghost?.remove();
         this.dragState = null;
     }
@@ -690,21 +764,138 @@ module.exports = class GifFolders {
         return ghost;
     }
 
-    async sendGif(url) {
+    isDiscordAttachmentUrl(url) {
+        return typeof url === "string" &&
+            /^https?:\/\/(?:cdn|media)\.discordapp\.(?:com|net)\/attachments\//i.test(url);
+    }
+
+    unsignedDiscordAttachmentUrls(url) {
+        if (!this.isDiscordAttachmentUrl(url)) return [];
+
+        try {
+            const parsed = new URL(url);
+            parsed.search = "";
+            parsed.hash = "";
+
+            const mediaUrl = parsed.toString();
+            if (parsed.hostname.toLowerCase() === "media.discordapp.net") {
+                parsed.hostname = "cdn.discordapp.com";
+            }
+
+            return [...new Set([parsed.toString(), mediaUrl])];
+        } catch {
+            return [];
+        }
+    }
+
+    async refreshDiscordAttachmentUrl(url) {
+        if (!this.isDiscordAttachmentUrl(url) || typeof this.RestAPI?.post !== "function") return null;
+
+        try {
+            const response = await this.RestAPI.post({
+                url: "/attachments/refresh-urls",
+                body: {attachment_urls: [url]}
+            });
+            const body = response?.body || response;
+            const refreshed = body?.refreshed_urls?.[0];
+            return typeof refreshed === "string"
+                ? refreshed
+                : refreshed?.refreshed || refreshed?.refreshed_url || refreshed?.url || null;
+        } catch (error) {
+            this.api.Logger.warn("Could not refresh a Discord attachment URL; trying its permanent form instead.", error);
+            return null;
+        }
+    }
+
+    findMessageComposer() {
+        const editors = [...document.querySelectorAll('[role="textbox"][contenteditable="true"]')];
+        return editors.find(editor =>
+            editor.dataset?.slateEditor === "true" ||
+            editor.closest?.('[class*="channelTextArea"]')
+        ) || null;
+    }
+
+    async sendThroughComposer(url) {
+        if (typeof this.ComponentDispatch?.dispatchToLastSubscribed !== "function") return false;
+
+        const editor = this.findMessageComposer();
+        if (!editor) return false;
+
+        this.ComponentDispatch.dispatchToLastSubscribed("INSERT_TEXT", {
+            rawText: url,
+            plainText: url
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 25));
+        editor.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            charCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true
+        }));
+        return true;
+    }
+
+    async sendGif(gif) {
+        if (this.sendingGif) return;
+        this.sendingGif = true;
+
         try {
             if (!this.MessageActions) this.resolveModules();
             const channelId = this.SelectedChannelStore?.getCurrentlySelectedChannelId?.() ||
                 this.SelectedChannelStore?.getChannelId?.();
 
-            if (!channelId || !this.MessageActions?.sendMessage) {
-                throw new Error("Could not find the current channel or Discord sendMessage action.");
+            if (!channelId) {
+                throw new Error("Could not find the current channel.");
             }
 
-            await this.MessageActions.sendMessage(channelId, {content: url});
-            this.closeFolderView();
+            const originalUrls = [gif.url, gif.src]
+                .filter(url => typeof url === "string" && /^https?:\/\//i.test(url));
+            const attachmentUrls = originalUrls.filter(url => this.isDiscordAttachmentUrl(url));
+            const refreshedUrl = attachmentUrls.length
+                ? await this.refreshDiscordAttachmentUrl(attachmentUrls[0])
+                : null;
+            const unsignedUrls = attachmentUrls.flatMap(url => this.unsignedDiscordAttachmentUrls(url));
+            const rawCandidates = attachmentUrls.length
+                ? [refreshedUrl, ...unsignedUrls, ...originalUrls]
+                : originalUrls;
+            const candidates = [...new Set(rawCandidates.filter(url => typeof url === "string" && /^https?:\/\//i.test(url)))];
+            if (!candidates.length) throw new Error("No valid URL was available for this GIF.");
+
+            if (await this.sendThroughComposer(candidates[0])) {
+                this.closeFolderView();
+                return;
+            }
+
+            if (!this.MessageActions?.sendMessage) {
+                throw new Error("Could not find Discord's composer or sendMessage action.");
+            }
+
+            let lastError = null;
+
+            for (const url of candidates) {
+                try {
+                    await this.MessageActions.sendMessage(channelId, {
+                        content: url,
+                        tts: false,
+                        validNonShortcutEmojis: []
+                    });
+                    this.closeFolderView();
+                    return;
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+
+            throw lastError || new Error("No valid URL was available for this GIF.");
         } catch (error) {
             this.api.Logger.error("Failed to send GIF", error);
             BdApi.UI.showToast("GIF Folders couldn't send that GIF.", {type: "error"});
+        } finally {
+            this.sendingGif = false;
         }
     }
 
@@ -861,6 +1052,7 @@ module.exports = class GifFolders {
                 for (const [url, folderId] of Object.entries(this.state.assignments)) {
                     if (folderId === folder.id) delete this.state.assignments[url];
                 }
+                delete this.state.orders[folder.id];
                 this.state.selectedFolder = "default";
                 this.saveState();
                 this.renderFolderView();
@@ -1142,6 +1334,17 @@ module.exports = class GifFolders {
             .gf-gif-card.gf-dragging {
                 opacity: .45;
                 transform: scale(.98);
+            }
+
+            .gf-gif-card.gf-reorder-target::after {
+                content: "";
+                position: absolute;
+                inset: 0;
+                z-index: 2;
+                border: 3px solid var(--brand-500, #5865f2);
+                border-radius: 8px;
+                box-sizing: border-box;
+                pointer-events: none;
             }
 
             .gf-drag-ghost {
