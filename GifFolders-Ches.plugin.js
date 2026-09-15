@@ -1,8 +1,9 @@
 /**
  * @name GifFolders
- * @description Adds persistent folders for your existing Discord favorite GIFs without removing anything from Discord Favorites.
+ * @description Adds persistent folders for your existing Discord favorite GIFs.
  * @version 1.1.1
  * @author Ches
+ * @authorLink https://github.com/0Chessz0
  */
 
 module.exports = class GifFolders {
@@ -318,10 +319,6 @@ module.exports = class GifFolders {
     }
 
     findGifHomeGrid() {
-        // Discord's GIF home cards are no longer guaranteed to be buttons. Search
-        // their visible labels instead, then find the first shared row/grid that
-        // owns both cards. This survives Discord changing the wrapper element or
-        // removing tabindex/role attributes from the cards.
         const favoriteLabels = this.findExactTextElements("Favorites");
         const trendingLabels = this.findExactTextElements("Trending GIFs");
 
