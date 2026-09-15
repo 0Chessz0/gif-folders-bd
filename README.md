@@ -1,7 +1,7 @@
 <div align="center">
 
 # 📁 Gif-Folders
-**Better organize your Discord GIFs into custom folders and tags.**
+**Better organize your Discord GIFs into custom folders.**
 
 *Inspired by [ImageFolder](https://betterdiscord.app/plugins/ImageFolder) & [Thunde's GIF Folders](https://github.com/thundeiv/Thunde-s-GIF-Folders-for-Vencord)*
 
